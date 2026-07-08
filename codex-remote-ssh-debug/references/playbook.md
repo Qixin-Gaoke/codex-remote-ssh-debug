@@ -24,6 +24,13 @@ It checks:
 - proxy ports `27890` and `27897`;
 - first matching app-server environment proxy variables;
 - likely PATH shadowing points.
+- optional thread presence in `state_*.sqlite`, `sessions/**`, and `shell_snapshots/**` when a thread id is passed.
+
+For a missing thread after reconnect:
+
+```sh
+scripts/codex_remote_probe.sh <ssh-alias> <thread-id>
+```
 
 ## Auth Shape
 
@@ -108,6 +115,15 @@ Codex app-server websocket closed (code=1006)
 Error: app-server control socket is already in use
 ```
 
+Observed failure pattern from a repaired Desktop SSH session:
+
+- the UI could spin or fail to load a known remote thread;
+- `read_thread` could temporarily return "No Codex thread found" even though the rollout JSONL and `state_*.sqlite` row existed;
+- the probe showed more than one `codex app-server --listen unix://` or `codex app-server proxy` process tree for the same remote user;
+- `${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server.log` contained `Error: app-server control socket is already in use`;
+- ChatGPT auth shape was healthy (`auth_mode=chatgpt`, `OPENAI_API_KEY` null, `tokens` present), so this was not an API-key or login-token issue;
+- the reverse proxy listener was still present, so the fix was the app-server/socket layer, not the VPN tunnel.
+
 Check:
 
 ```sh
@@ -122,6 +138,31 @@ ssh <host> 'ps -eo pid,comm,args | awk '\''($2=="node" || $2=="codex") && $0 ~ /
 ```
 
 Avoid `pkill -f "codex app-server"` from inside a shell command that contains that same string; it can kill the current SSH command.
+
+After cleanup, rerun the probe. A healthy recovery has one app-server tree at most, a freshly-created `app-server-control.sock`, and an empty or non-fatal `app-server.log`. Preserve reverse SSH tunnel processes such as `ssh -N -T ... -R 127.0.0.1:27897:127.0.0.1:7897`; they are transport and should not be killed as part of app-server cleanup.
+
+## Missing Thread After Reconnect
+
+If a thread id is not listed after an app-server repair, do not assume the session was deleted. Check remote storage:
+
+```sh
+ssh <host> 'find ~/.codex/sessions -type f -name "*<thread-id>*.jsonl" -print'
+ssh <host> 'find ~/.codex/shell_snapshots -type f -name "*<thread-id>*" -print 2>/dev/null || true'
+ssh <host> 'python3 - <<'"'"'PY'"'"'
+import pathlib, sqlite3
+needle="<thread-id>"
+for db in pathlib.Path.home().joinpath(".codex").glob("state_*.sqlite"):
+    con=sqlite3.connect(str(db))
+    try:
+        row=con.execute("select id, rollout_path, archived, cwd, updated_at from threads where id=?", (needle,)).fetchone()
+        if row:
+            print(db, row)
+    finally:
+        con.close()
+PY'
+```
+
+If the rollout JSONL and `threads` row exist and `archived=0`, the data is present. Let Desktop reload after the app-server/socket fix, or navigate to the thread again. Treat this as a remote app-server/index exposure problem, not as session loss.
 
 ## Reverse VPN Tunnel
 
@@ -144,6 +185,14 @@ ssh <host> 'ss -ltnp | grep 27897; curl -I --max-time 20 -x http://127.0.0.1:278
 ```
 
 A Cloudflare `421` after `HTTP/1.1 200 Connection established` still proves the proxy tunnel is working.
+
+Keep the model of the system separate:
+
+- ChatGPT login state lives in `~/.codex/auth.json`; inspect only shape, never token values.
+- Reverse SSH tunnels and proxy ports (`27897`, local Clash-style ports such as `7897`) are network transport.
+- `app-server-control.sock`, `codex app-server --listen unix://`, and `codex app-server proxy` are the Desktop remote runtime link.
+
+Fix the layer that evidence points to. A healthy ChatGPT auth shape plus a live reverse tunnel does not rule out stale app-server sockets.
 
 ## Wrapper Pattern
 

@@ -2,14 +2,16 @@
 set -eu
 
 if [ "$#" -lt 1 ]; then
-  echo "usage: $0 <ssh-host-alias>" >&2
+  echo "usage: $0 <ssh-host-alias> [thread-id]" >&2
   exit 2
 fi
 
 host="$1"
+thread_id="${2:-}"
 
-ssh -o BatchMode=yes -o ConnectTimeout=30 "$host" 'sh -s' <<'REMOTE'
+ssh -o BatchMode=yes -o ConnectTimeout=30 "$host" 'sh -s' -- "$thread_id" <<'REMOTE'
 set -eu
+thread_id="${1:-}"
 
 section() {
   printf "\n=== %s ===\n" "$1"
@@ -63,4 +65,31 @@ for p in "$HOME/.local/bin/codex" /usr/local/bin/codex /usr/local/bin/codex-real
     head -8 "$p" 2>/dev/null || true
   fi
 done
+
+if [ -n "$thread_id" ]; then
+  section "thread presence"
+  echo "thread_id=$thread_id"
+  find "${CODEX_HOME:-$HOME/.codex}/sessions" -type f -name "*$thread_id*.jsonl" -print 2>/dev/null || true
+  find "${CODEX_HOME:-$HOME/.codex}/shell_snapshots" -type f -name "*$thread_id*" -print 2>/dev/null || true
+  THREAD_ID="$thread_id" python3 - <<'PY' 2>/dev/null || true
+import os, pathlib, sqlite3
+needle = os.environ["THREAD_ID"]
+root = pathlib.Path(os.environ.get("CODEX_HOME", pathlib.Path.home() / ".codex"))
+for db in sorted(root.glob("state_*.sqlite")):
+    try:
+        con = sqlite3.connect(str(db))
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            "select id, rollout_path, archived, cwd, updated_at from threads where id=?",
+            (needle,),
+        ).fetchone()
+        if row:
+            print("state_db=" + str(db))
+            for key in row.keys():
+                print(f"{key}={row[key]}")
+        con.close()
+    except Exception as exc:
+        print(f"state_db_error={db}:{type(exc).__name__}:{exc}")
+PY
+fi
 REMOTE
