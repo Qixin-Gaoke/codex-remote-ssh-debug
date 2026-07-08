@@ -9,6 +9,18 @@ fi
 host="$1"
 thread_id="${2:-}"
 
+section() {
+  printf "\n=== %s ===\n" "$1"
+}
+
+section "local desktop ssh and tunnel hints"
+printf "requested_host=%s\n" "$host"
+ssh -G "$host" 2>/dev/null | grep -Ei '^(host|hostname|user|port|remoteforward|exitonforwardfailure|serveralive)' || true
+ps aux 2>/dev/null | grep -E '[s]sh .*CODEX_REMOTE_PAYLOAD|[s]sh .*codex app-server proxy|[r]emote-vpn-tunnel|[s]sh .* -R 127\.0\.0\.1:27897' | sed -n '1,80p' || true
+if command -v launchctl >/dev/null 2>&1; then
+  launchctl list 2>/dev/null | grep -Ei "remote-vpn-tunnel|${host}" || true
+fi
+
 ssh -o BatchMode=yes -o ConnectTimeout=30 "$host" 'sh -s' -- "$thread_id" <<'REMOTE'
 set -eu
 thread_id="${1:-}"
@@ -59,6 +71,18 @@ ss -ltnp 2>/dev/null | grep -E '27890|27897|7897' || true
 
 section "normal shell proxy env"
 env | grep -E '^(CODEX_SSH_PROXY_URL|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|http_proxy|https_proxy|all_proxy|NO_PROXY|no_proxy)=' || true
+
+section "proxy consumer audit"
+for e in /proc/[0-9]*/environ; do
+  pid="${e#/proc/}"
+  pid="${pid%/environ}"
+  vars=$({ tr "\0" "\n" <"$e"; } 2>/dev/null | grep -Ei '^(CODEX_SSH_PROXY_URL|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|http_proxy|https_proxy|all_proxy)=' || true)
+  [ -n "$vars" ] || continue
+  comm=$(cat "/proc/$pid/comm" 2>/dev/null || true)
+  args=$(tr "\0" " " <"/proc/$pid/cmdline" 2>/dev/null | cut -c1-220)
+  printf -- "--- PID:%s COMM:%s ARGS:%s\n" "$pid" "$comm" "$args"
+  printf "%s\n" "$vars"
+done
 
 section "proxy transport tests"
 for port in 27897 27890; do

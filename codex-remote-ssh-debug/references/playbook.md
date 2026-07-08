@@ -8,6 +8,9 @@
   - transport is the remote reaching Codex through direct network or a local-machine VPN/proxy tunnel;
   - runtime is Desktop's SSH bootstrap, app-server socket/proxy, websocket, and rollout/session files.
 - A working VPN tunnel does not imply correct auth. Correct auth does not imply the remote can reach the Codex backend.
+- The alias passed to a probe might not be the alias used by an existing Desktop thread. Always inspect local Desktop SSH processes and validate the actual alias shown there.
+- A `RemoteForward` in `~/.ssh/config` is bound to the lifetime of the SSH connection that opened it. A probe can temporarily create `127.0.0.1:27897` on the remote and make transport look healthy, then the listener disappears when the probe exits. For Codex Desktop, prefer a persistent tunnel process or LaunchAgent when the remote needs the user's local VPN.
+- Persistent reverse tunnels are not the same thing as persistent heavy VPN traffic. Idle tunnels mostly spend SSH keepalive bytes. The traffic risk is remote processes with `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, or explicit `127.0.0.1:27897` usage.
 - Treat `~/.codex/auth.json` as sensitive. Print shape only, never values.
 - Codex Desktop uses a login shell bootstrap. User startup files can break a non-PTY SSH command even when normal `ssh host` works.
 
@@ -21,6 +24,8 @@ scripts/codex_remote_probe.sh <ssh-alias>
 
 It checks:
 
+- local Codex Desktop SSH processes and local persistent tunnel hints for the requested host;
+- local `ssh -G` forwarding settings for the requested host;
 - `codex` discovery and version;
 - auth shape without token values;
 - `codex login status` without token values;
@@ -28,6 +33,7 @@ It checks:
 - app-server socket and log;
 - proxy ports `27890` and `27897`;
 - Codex backend reachability through `CODEX_SSH_PROXY_URL` or `127.0.0.1:27897` when present;
+- a proxy consumer audit that scans process environments for proxy variables without printing tokens;
 - first matching app-server environment proxy variables;
 - likely PATH shadowing points.
 - optional thread presence in `state_*.sqlite`, `sessions/**`, and `shell_snapshots/**` when a thread id is passed.
@@ -37,6 +43,14 @@ For a missing thread after reconnect:
 ```sh
 scripts/codex_remote_probe.sh <ssh-alias> <thread-id>
 ```
+
+Before changing remote files, verify the actual Desktop alias:
+
+```sh
+ps aux | grep -E '[s]sh .*codex app-server proxy|[s]sh .*CODEX_REMOTE_PAYLOAD'
+```
+
+If the failing thread uses `a100-dev` but you probe or edit `A100`, fix `a100-dev` or add a persistent tunnel for `a100-dev`; otherwise the thread will keep bypassing the VPN configuration you just added elsewhere.
 
 ## Auth Shape
 
@@ -240,6 +254,25 @@ ssh -N -T \
   <host>
 ```
 
+If the user already uses Codex Desktop LaunchAgents for other remotes, add a matching persistent tunnel for the actual Desktop alias instead of relying on Desktop's transient SSH command. Example LaunchAgent shape:
+
+```xml
+<key>ProgramArguments</key>
+<array>
+  <string>/bin/zsh</string>
+  <string>/Users/<user>/Library/Application Support/Codex/remote-vpn-tunnel.sh</string>
+  <string><actual-desktop-ssh-alias></string>
+  <string>27897</string>
+  <string>7897</string>
+</array>
+```
+
+After starting the persistent tunnel, validate through the actual alias without creating a new `RemoteForward` in that validation command:
+
+```sh
+ssh <actual-desktop-ssh-alias> 'ss -ltnp | grep 27897; curl --proxy http://127.0.0.1:27897 -I -m 20 https://chatgpt.com/backend-api/codex/responses | sed -n "1,8p"'
+```
+
 Validate from remote:
 
 ```sh
@@ -272,6 +305,30 @@ Keep the model of the system separate:
 Fix the layer that evidence points to. A healthy ChatGPT auth shape plus a live reverse tunnel does not rule out stale app-server sockets.
 
 In one verified setup, local LaunchAgents kept remote `127.0.0.1:27897` forwarded to a local proxy on `127.0.0.1:7897`. Remote shell startup exported `CODEX_SSH_PROXY_URL=http://127.0.0.1:27897`, while full `HTTP_PROXY`/`HTTPS_PROXY` was applied only for the Desktop app-server payload. This avoided turning every ordinary SSH command into a proxied command.
+
+## VPN Traffic Hygiene
+
+The safe target state is:
+
+- persistent tunnel processes may exist for remotes that need local VPN access;
+- ordinary remote shells have no generic `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY`;
+- `CODEX_SSH_PROXY_URL` may exist for Codex-specific paths, but ordinary `curl`, `pip`, `git`, and benchmark runners do not use it by default;
+- Codex app-server/proxy processes may have `CODEX_SSH_PROXY_URL` and generic proxy variables;
+- benchmark runners, dataset downloads, `pip`, `git`, and ordinary `curl` do not have generic proxy variables and do not call `127.0.0.1:27897`.
+
+Check normal shell state:
+
+```sh
+ssh <host> 'env | grep -Ei "^(HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|http_proxy|https_proxy|all_proxy|CODEX_SSH_PROXY_URL)=" || true'
+```
+
+Audit active process environments without token values:
+
+```sh
+ssh <host> 'for e in /proc/[0-9]*/environ; do pid=${e#/proc/}; pid=${pid%/environ}; vars=$({ tr "\0" "\n" <"$e"; } 2>/dev/null | grep -Ei "^(HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|http_proxy|https_proxy|all_proxy|CODEX_SSH_PROXY_URL)=" || true); [ -n "$vars" ] || continue; comm=$(cat /proc/$pid/comm 2>/dev/null || true); args=$({ tr "\0" " " < /proc/$pid/cmdline; } 2>/dev/null | cut -c1-180); printf -- "--- PID:%s COMM:%s ARGS:%s\n%s\n" "$pid" "$comm" "$args" "$vars"; done'
+```
+
+If non-Codex workloads are using the proxy, remove global proxy exports from shell startup files or system services, then restart only the affected workload. Keep the reverse tunnel if Codex still needs it.
 
 ## Wrapper Pattern
 

@@ -15,10 +15,11 @@ Use this skill to debug Codex Desktop's SSH remote flow end to end: SSH bootstra
 - Do not delete `~/.codex/auth.json` unless the user explicitly asks. If repairing a wrong API-key auth shape, back it up first.
 - Do not overwrite user SSH config or shell startup files without backing them up.
 - Do not kill unrelated SSH sessions. Preserve long-running reverse VPN tunnels unless they are the target.
+- Do not make global remote shells or user workloads use the local VPN. Keep generic `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` absent outside Codex app-server/proxy processes unless the user explicitly asks otherwise.
 
 ## Workflow
 
-1. Confirm the failing alias and error text from the UI.
+1. Confirm the failing alias and error text from the UI. Also inspect the local Codex Desktop SSH process list to find the alias actually used by the failing thread; users often report a friendly alias while the thread is bound to another host entry.
 2. Run the read-only probe:
    `scripts/codex_remote_probe.sh <ssh-alias>`
    If a specific thread is missing after reconnect, include it:
@@ -27,7 +28,7 @@ Use this skill to debug Codex Desktop's SSH remote flow end to end: SSH bootstra
    - Install/discovery failure: `command -v codex` missing or wrong PATH.
    - Bootstrap timeout: SSH command or login shell startup hangs before magic bytes return.
    - Websocket/app-server 1006: proxy cannot connect to the app-server socket, the socket is stale, or multiple app-servers/proxies fight over it.
-   - Networking failure: remote app-server starts but cannot reach OpenAI without the user's local VPN/proxy, or only `CODEX_SSH_PROXY_URL` is set while child HTTP paths need standard proxy env.
+   - Networking failure: remote app-server starts but cannot reach OpenAI without the user's local VPN/proxy, the actual Desktop SSH alias lacks a reverse tunnel, a probe-created tunnel disappeared after the probe exited, or only `CODEX_SSH_PROXY_URL` is set while child HTTP paths need standard proxy env.
    - Auth-shape failure: `auth.json` uses API-key shape when the user expects ChatGPT login, often surfacing as `Quota exceeded`.
    - Session-state failure: Desktop says a thread is missing or archived while rollout files and the thread row still exist.
 4. Apply the smallest targeted fix, then rerun the probe and a Desktop-shaped bootstrap simulation.
@@ -43,8 +44,9 @@ Use this skill to debug Codex Desktop's SSH remote flow end to end: SSH bootstra
 - **PATH shadowing**: Codex Desktop prepends `${CODEX_INSTALL_DIR:-$HOME/.local/bin}`. Ensure `$HOME/.local/bin/codex` and `/usr/local/bin/codex` resolve to the same wrapper or binary.
 - **Stale socket / duplicate app-servers**: If the probe shows multiple `codex app-server` or `codex app-server proxy` trees and `app-server control socket is already in use`, kill only the target user's `node`/`codex` app-server processes, then remove `${CODEX_HOME:-$HOME/.codex}/app-server-control`.
 - **Slow login shell**: Codex uses the user's login shell with `-l -i`. If `.bashrc` sources heavy environment scripts, add a backed-up fast path that returns early when `CODEX_REMOTE_PAYLOAD` is set.
-- **Local VPN required**: Keep a reverse SSH tunnel such as `-R 127.0.0.1:27897:127.0.0.1:7897`, then make remote Codex use `http://127.0.0.1:27897`.
+- **Local VPN required**: Keep a persistent reverse SSH tunnel such as `-R 127.0.0.1:27897:127.0.0.1:7897`, then make remote Codex use `http://127.0.0.1:27897`. Do not treat a listener created only by the probe's own SSH connection as durable; re-check through the actual Desktop alias after the probe exits.
 - **Codex-only proxy env**: If ordinary remote shells should not burn local VPN traffic, keep generic proxy vars unset globally and inject `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` only for `CODEX_REMOTE_PAYLOAD` values that start Codex app-server.
+- **VPN traffic hygiene**: Idle reverse tunnels use only SSH keepalive traffic. VPN usage grows when remote processes actively send HTTP/WebSocket traffic through `127.0.0.1:27897`. Audit process environments and ensure benchmark, download, `pip`, and `git` processes do not have generic proxy variables.
 - **Auth confusion**: Preserve ChatGPT login mode. Do not set `OPENAI_API_KEY` to an access token, and do not assume an `sk-proj...` API key uses the same quota as the user's ChatGPT/Codex login.
 - **Stale app-server auth**: After changing remote auth shape, restart the target user's app-server/proxy so Desktop uses the new credentials.
 - **Thread missing after reconnect**: First fix the app-server/socket layer, then rerun the probe with the thread id and check that `state_*.sqlite` and `sessions/**/rollout-*<thread-id>.jsonl` still contain the thread before assuming data loss.
@@ -65,4 +67,5 @@ On the remote host, the desired state is usually:
 - `auth_mode=chatgpt`, `OPENAI_API_KEY is null`, and `tokens` exists when using login auth;
 - `codex login status` agrees with the intended login mode;
 - remote proxy port reaches the Codex backend if the remote needs the user's local VPN;
+- ordinary remote shells do not expose generic proxy variables, and the proxy consumer audit does not show benchmark/download/pip/git processes using `127.0.0.1:27897`;
 - Desktop-shaped bootstrap returns magic bytes in under a few seconds.
