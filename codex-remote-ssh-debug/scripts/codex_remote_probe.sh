@@ -41,6 +41,11 @@ print("has_tokens=" + str(isinstance(data.get("tokens"), dict)))
 print("top_level_keys=" + ",".join(sorted(data.keys())))
 PY
 
+section "codex login status"
+PATH="${CODEX_INSTALL_DIR:-$HOME/.local/bin}:$PATH"
+export PATH
+codex login status 2>&1 | sed -E 's/(sk-[A-Za-z0-9_-]{8})[A-Za-z0-9_-]+/\1***/g' || true
+
 section "app-server processes"
 ps -eo pid,ppid,lstart,comm,args | grep -E '[c]odex app-server|[n]ode .*codex|desktop-ssh-websocket' || true
 
@@ -51,6 +56,35 @@ sed -n "1,160p" "$control/app-server.log" 2>/dev/null || true
 
 section "proxy listeners"
 ss -ltnp 2>/dev/null | grep -E '27890|27897|7897' || true
+
+section "normal shell proxy env"
+env | grep -E '^(CODEX_SSH_PROXY_URL|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|http_proxy|https_proxy|all_proxy|NO_PROXY|no_proxy)=' || true
+
+section "proxy transport tests"
+for port in 27897 27890; do
+  if ss -ltn 2>/dev/null | grep -q "127.0.0.1:${port}\\|\\[::1\\]:${port}"; then
+    out="/tmp/codex_remote_probe_proxy_${port}.out"
+    printf "proxy=http://127.0.0.1:%s " "$port"
+    timeout 12 curl -sS -o "$out" -w "http=%{http_code} total=%{time_total}\n" \
+      --proxy "http://127.0.0.1:${port}" https://api.openai.com/v1/models 2>/dev/null || true
+    head -c 160 "$out" 2>/dev/null || true
+    printf "\n"
+  else
+    printf "proxy=http://127.0.0.1:%s listener=missing\n" "$port"
+  fi
+done
+
+section "codex backend via proxy"
+proxy_url="${CODEX_SSH_PROXY_URL:-}"
+if [ -z "$proxy_url" ] && ss -ltn 2>/dev/null | grep -q '127.0.0.1:27897'; then
+  proxy_url="http://127.0.0.1:27897"
+fi
+if [ -n "$proxy_url" ]; then
+  echo "proxy_url_present=True"
+  timeout 12 curl --proxy "$proxy_url" -I -m 12 https://chatgpt.com/backend-api/codex/responses 2>&1 | sed -n '1,8p' || true
+else
+  echo "proxy_url_present=False"
+fi
 
 section "app-server env"
 for p in $(ps -eo pid,args | awk '/app-server/ && !/awk/ {print $1}'); do

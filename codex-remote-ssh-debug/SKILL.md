@@ -1,6 +1,6 @@
 ---
 name: codex-remote-ssh-debug
-description: Diagnose and repair Codex Desktop remote SSH connections, including SSH bootstrap timeouts, app-server websocket code 1006, stale app-server sockets, duplicate app-server/proxy trees, PATH shadowing, ChatGPT login-token versus API-key auth confusion, missing thread indexes after reconnect, and remote networking through the user's local VPN or proxy tunnel. Use when Codex Desktop SSH remotes are stuck spinning, show "remote computer does not have Codex installed", "app-server bootstrap timed out", "Codex app-server websocket closed", "app-server control socket is already in use", or need a local-machine VPN/proxy for remote Codex traffic.
+description: Diagnose and repair Codex Desktop remote SSH connections, including SSH bootstrap timeouts, app-server websocket code 1006, stale app-server sockets, duplicate app-server/proxy trees, PATH shadowing, ChatGPT login-token versus API-key auth confusion, quota errors from wrong auth mode, missing or archived thread rollout files after reconnect, and remote networking through a local VPN/proxy tunnel. Use when Codex Desktop SSH remotes are stuck spinning, show "remote computer does not have Codex installed", "app-server bootstrap timed out", "Codex app-server websocket closed", "app-server control socket is already in use", "Quota exceeded", "stream disconnected before completion", or need a local-machine VPN/proxy for remote Codex app-server traffic.
 ---
 
 # Codex Remote SSH Debug
@@ -27,9 +27,9 @@ Use this skill to debug Codex Desktop's SSH remote flow end to end: SSH bootstra
    - Install/discovery failure: `command -v codex` missing or wrong PATH.
    - Bootstrap timeout: SSH command or login shell startup hangs before magic bytes return.
    - Websocket/app-server 1006: proxy cannot connect to the app-server socket, the socket is stale, or multiple app-servers/proxies fight over it.
-   - Networking failure: remote app-server starts but cannot reach OpenAI without the user's local VPN/proxy.
-   - Auth-shape failure: `auth.json` uses API-key shape when the user expects ChatGPT login.
-   - Session-state failure: Desktop says a thread is missing while rollout files and the thread row still exist.
+   - Networking failure: remote app-server starts but cannot reach OpenAI without the user's local VPN/proxy, or only `CODEX_SSH_PROXY_URL` is set while child HTTP paths need standard proxy env.
+   - Auth-shape failure: `auth.json` uses API-key shape when the user expects ChatGPT login, often surfacing as `Quota exceeded`.
+   - Session-state failure: Desktop says a thread is missing or archived while rollout files and the thread row still exist.
 4. Apply the smallest targeted fix, then rerun the probe and a Desktop-shaped bootstrap simulation.
 
 ## What To Read Next
@@ -44,7 +44,9 @@ Use this skill to debug Codex Desktop's SSH remote flow end to end: SSH bootstra
 - **Stale socket / duplicate app-servers**: If the probe shows multiple `codex app-server` or `codex app-server proxy` trees and `app-server control socket is already in use`, kill only the target user's `node`/`codex` app-server processes, then remove `${CODEX_HOME:-$HOME/.codex}/app-server-control`.
 - **Slow login shell**: Codex uses the user's login shell with `-l -i`. If `.bashrc` sources heavy environment scripts, add a backed-up fast path that returns early when `CODEX_REMOTE_PAYLOAD` is set.
 - **Local VPN required**: Keep a reverse SSH tunnel such as `-R 127.0.0.1:27897:127.0.0.1:7897`, then make remote Codex use `http://127.0.0.1:27897`.
-- **Auth confusion**: Preserve ChatGPT login mode. Do not set `OPENAI_API_KEY` to an access token.
+- **Codex-only proxy env**: If ordinary remote shells should not burn local VPN traffic, keep generic proxy vars unset globally and inject `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` only for `CODEX_REMOTE_PAYLOAD` values that start Codex app-server.
+- **Auth confusion**: Preserve ChatGPT login mode. Do not set `OPENAI_API_KEY` to an access token, and do not assume an `sk-proj...` API key uses the same quota as the user's ChatGPT/Codex login.
+- **Stale app-server auth**: After changing remote auth shape, restart the target user's app-server/proxy so Desktop uses the new credentials.
 - **Thread missing after reconnect**: First fix the app-server/socket layer, then rerun the probe with the thread id and check that `state_*.sqlite` and `sessions/**/rollout-*<thread-id>.jsonl` still contain the thread before assuming data loss.
 
 ## Validation
@@ -61,5 +63,6 @@ On the remote host, the desired state is usually:
 - app-server socket exists only after Desktop starts it;
 - app-server log is empty or non-fatal;
 - `auth_mode=chatgpt`, `OPENAI_API_KEY is null`, and `tokens` exists when using login auth;
-- remote proxy port responds if the remote needs the user's local VPN;
+- `codex login status` agrees with the intended login mode;
+- remote proxy port reaches the Codex backend if the remote needs the user's local VPN;
 - Desktop-shaped bootstrap returns magic bytes in under a few seconds.
