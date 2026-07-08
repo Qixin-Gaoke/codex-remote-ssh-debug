@@ -273,71 +273,6 @@ Fix the layer that evidence points to. A healthy ChatGPT auth shape plus a live 
 
 In one verified setup, local LaunchAgents kept remote `127.0.0.1:27897` forwarded to a local proxy on `127.0.0.1:7897`. Remote shell startup exported `CODEX_SSH_PROXY_URL=http://127.0.0.1:27897`, while full `HTTP_PROXY`/`HTTPS_PROXY` was applied only for the Desktop app-server payload. This avoided turning every ordinary SSH command into a proxied command.
 
-## Codex-Only Reverse Proxy Without Global Remote Proxy
-
-Thread `019f39af-f94e-7072-81a0-26a3f3c13e83` repaired a remote named `180-ascend-bench` whose normal SSH worked, but Codex Desktop remote threads repeatedly timed out after the proxy setup was changed to avoid sending all remote traffic through the user's local VPN.
-
-Observed shape:
-
-- direct SSH to `180-ascend-bench` worked;
-- a Codex-specific alias used `RemoteForward 27897 127.0.0.1:7897` with `ExitOnForwardFailure yes`;
-- local proxy `127.0.0.1:7897` was reachable;
-- remote `127.0.0.1:27897` was already listening, so a second tunnel attempt failed with `remote port forwarding failed for listen port 27897`;
-- remote shells had `CODEX_SSH_PROXY_URL=http://127.0.0.1:27897` but intentionally did not have global `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`;
-- app-server logs repeated `failed to refresh available models: timeout waiting for child process to exit` and MCP `http/request failed` lines for `https://chatgpt.com/backend-api/ps/mcp`.
-
-Transport versus auth check:
-
-```sh
-nc -vz 127.0.0.1 7897
-ssh 180-ascend-bench 'ss -ltnp | grep 27897'
-ssh 180-ascend-bench 'timeout 8 curl -sS -o /tmp/codex_proxy_test.out -w "proxy_http=%{http_code} total=%{time_total}\n" --proxy http://127.0.0.1:27897 https://api.openai.com/v1/models; head -c 120 /tmp/codex_proxy_test.out; echo'
-```
-
-If the proxied request returns `401` with a "Missing bearer authentication" style body, the tunnel is working. That is a transport success because no bearer header was supplied. It is not evidence of a bad ChatGPT login token or wrong API key.
-
-Also test the direct remote path:
-
-```sh
-ssh 180-ascend-bench 'timeout 8 curl -sS -o /tmp/codex_direct_test.out -w "direct_http=%{http_code} total=%{time_total}\n" https://api.openai.com/v1/models || true'
-```
-
-If direct remote curl times out while proxied curl reaches `401`, the problem is network routing for the remote app-server, not authentication.
-
-In this thread, the remote Codex binary exposed standard proxy environment names such as `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and lowercase variants, but did not show `CODEX_SSH_PROXY_URL` in `strings`. The reusable rule is: do not rely on `CODEX_SSH_PROXY_URL` alone for older remote Codex versions or child processes. Ensure the app-server process has standard proxy variables.
-
-To avoid routing ordinary experiments through the local VPN, inject standard proxy variables only for Codex app-server payloads. Put the block before the interactive return in remote `.bashrc`, after making a backup:
-
-```sh
-cp -p ~/.bashrc ~/.bashrc.bak-codex-proxy-$(date +%Y%m%d)
-```
-
-```sh
-# Codex app-server-only proxy env via SSH remote forward.
-# This keeps normal SSH sessions and experiment commands off the local VPN.
-case "${CODEX_REMOTE_PAYLOAD:-}" in
-  *"codex app-server"*)
-    export HTTP_PROXY="${CODEX_SSH_PROXY_URL:-http://127.0.0.1:27897}"
-    export HTTPS_PROXY="${CODEX_SSH_PROXY_URL:-http://127.0.0.1:27897}"
-    export ALL_PROXY="${CODEX_SSH_PROXY_URL:-http://127.0.0.1:27897}"
-    export http_proxy="$HTTP_PROXY"
-    export https_proxy="$HTTPS_PROXY"
-    export all_proxy="$ALL_PROXY"
-    export NO_PROXY="localhost,127.0.0.1,::1"
-    export no_proxy="$NO_PROXY"
-    ;;
-esac
-```
-
-Validate both paths:
-
-```sh
-ssh 180-ascend-bench 'CODEX_REMOTE_PAYLOAD="codex app-server proxy" bash -lic '\''printf "HTTP_PROXY=%s\nHTTPS_PROXY=%s\nALL_PROXY=%s\nNO_PROXY=%s\n" "$HTTP_PROXY" "$HTTPS_PROXY" "$ALL_PROXY" "$NO_PROXY"'\'''
-ssh 180-ascend-bench 'bash -lc '\''printf "normal_HTTP_PROXY=%s\n" "${HTTP_PROXY:-none}"'\'''
-```
-
-The app-server-shaped shell should show `http://127.0.0.1:27897`. The normal shell should remain `none`. After restarting the target app-server/proxy, verify its process environment contains standard proxy variables without printing any auth fields.
-
 ## Wrapper Pattern
 
 Use only when the remote must always use the reverse tunnel. Preserve login auth shape.
@@ -378,44 +313,6 @@ If SSH fails before authentication:
 
 - `REMOTE HOST IDENTIFICATION HAS CHANGED`: back up `known_hosts`, remove only the offending host:port, rescan keys.
 - `Exceeded MaxStartups` or `banner exchange timeout`: reduce concurrent probes, wait, and avoid parallel SSH calls.
-
-In thread `019f39af-f94e-7072-81a0-26a3f3c13e83`, `Exceeded MaxStartups` was caused by a local launchd tunnel checker repeatedly opening SSH sessions every minute. The checker intended to keep `180-ascend-bench-codex` alive, but its remote health test ran direct `curl -I https://api.openai.com` without `--proxy`. Because normal remote shells intentionally had no global proxy, the health check always failed, restarted the tunnel, and created an SSH connection storm.
-
-Check for this pattern locally:
-
-```sh
-launchctl print gui/$(id -u)/com.shuhao.codex-ssh-forward-180-ascend-bench 2>/dev/null | sed -n '1,120p'
-sed -n '1,220p' ~/.local/bin/codex-ssh-forward-180-ascend-bench
-tail -80 ~/.codex/log/codex-ssh-forward-180-ascend-bench.log
-ps aux | grep -E 'ssh .*180-ascend-bench' | grep -v grep
-```
-
-The reusable fix is to make the checker test the remote proxy explicitly, and to match tunnel processes broadly enough when restarting:
-
-```sh
-REMOTE_PROXY="http://127.0.0.1:27897"
-remote_proxy_ready() {
-  ssh -o BatchMode=yes -o ConnectTimeout=8 "$DIRECT_HOST" \
-    "curl -I --proxy '$REMOTE_PROXY' --max-time 12 '$REMOTE_CHECK_URL' >/dev/null 2>&1"
-}
-
-restart_forward() {
-  pkill -f "ssh .*${FORWARD_HOST}" >/dev/null 2>&1 || true
-  ssh -fN "$FORWARD_HOST"
-}
-```
-
-When stabilizing the storm, stop the launchd job first, clean up stale local SSH attempts, then restart after the checker is fixed:
-
-```sh
-launchctl bootout gui/$(id -u) com.shuhao.codex-ssh-forward-180-ascend-bench
-pkill -f 'ssh .*180-ascend-bench-codex' || true
-~/.local/bin/codex-ssh-forward-180-ascend-bench
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.shuhao.codex-ssh-forward-180-ascend-bench.plist
-launchctl kickstart -k gui/$(id -u)/com.shuhao.codex-ssh-forward-180-ascend-bench
-```
-
-If a remote app-server log contains `Error: app-server control socket is already in use`, first check whether a healthy app-server and proxy are already running. In this thread the line appeared during duplicate bootstrap attempts; it was not fatal once a single current app-server/proxy tree and socket existed.
 
 ## Final Validation Checklist
 
