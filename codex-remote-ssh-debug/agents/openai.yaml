@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Remote SSH Debug"
+  short_description: "Debug Codex Desktop SSH remotes"
+  default_prompt: "Use $codex-remote-ssh-debug to diagnose a Codex Desktop SSH remote that is stuck, timing out, or failing app-server bootstrap."
